@@ -75,359 +75,359 @@ import org.jboss.forge.service.ui.RestUIContext;
 import org.jboss.forge.service.ui.RestUIRuntime;
 import org.jboss.forge.service.util.UICommandHelper;
 import org.jboss.resteasy.plugins.providers.multipart.MultipartFormDataOutput;
+import org.wildfly.swarm.topology.Advertise;
 
 import io.openshift.launchpad.backend.ForgeInitializer;
 import io.openshift.launchpad.backend.event.FurnaceStartup;
 import io.openshift.launchpad.backend.util.JsonBuilder;
 
-import org.wildfly.swarm.topology.Advertise;
-
 @javax.ws.rs.Path("/launchpad")
 @ApplicationScoped
-@Advertise("backend")
+@Advertise("launchpad-backend")
 public class LaunchpadResource
 {
-   private static final String DEFAULT_COMMAND_NAME = "launchpad-new-project";
+    private static final String DEFAULT_COMMAND_NAME = "launchpad-new-project";
 
-   private static final Logger log = Logger.getLogger(LaunchpadResource.class.getName());
-   private static final String LAUNCHPAD_MISSIONCONTROL_SERVICE_HOST = "LAUNCHPAD_MISSIONCONTROL_SERVICE_HOST";
-   private static final String LAUNCHPAD_MISSIONCONTROL_SERVICE_PORT = "LAUNCHPAD_MISSIONCONTROL_SERVICE_PORT";
+    private static final Logger log = Logger.getLogger(LaunchpadResource.class.getName());
+    private static final String LAUNCHPAD_MISSIONCONTROL_SERVICE_HOST = "LAUNCHPAD_MISSIONCONTROL_SERVICE_HOST";
+    private static final String LAUNCHPAD_MISSIONCONTROL_SERVICE_PORT = "LAUNCHPAD_MISSIONCONTROL_SERVICE_PORT";
 
-   private URI missionControlURI;
+    private URI missionControlURI;
 
-   private final Map<String, String> commandMap = new TreeMap<>();
-   private final BlockingQueue<Path> directoriesToDelete = new LinkedBlockingQueue<>();
+    private final Map<String, String> commandMap = new TreeMap<>();
+    private final BlockingQueue<Path> directoriesToDelete = new LinkedBlockingQueue<>();
 
-   @javax.annotation.Resource
-   private ManagedExecutorService executorService;
+    @javax.annotation.Resource
+    private ManagedExecutorService executorService;
 
-   public LaunchpadResource()
-   {
-      commandMap.put("launchpad-new-project", "Launchpad: New Project");
-      commandMap.put("launchpad-new-starter-project", "Launchpad: New Starter Project");
-   }
+    public LaunchpadResource()
+    {
+        commandMap.put("launchpad-new-project", "Launchpad: New Project");
+        commandMap.put("launchpad-new-starter-project", "Launchpad: New Starter Project");
+    }
 
-   @Inject
-   private CommandFactory commandFactory;
+    @Inject
+    private CommandFactory commandFactory;
 
-   @Inject
-   private CommandControllerFactory controllerFactory;
+    @Inject
+    private CommandControllerFactory controllerFactory;
 
-   @Inject
-   private ResourceFactory resourceFactory;
+    @Inject
+    private ResourceFactory resourceFactory;
 
-   @Inject
-   private UICommandHelper helper;
+    @Inject
+    private UICommandHelper helper;
 
-   void init(@Observes FurnaceStartup startup)
-   {
-      try
-      {
-         // Initialize Catapult URL
-         initializeMissionControlServiceURI();
-         log.info("Warming up internal cache");
-         // Warm up
-         getCommand(DEFAULT_COMMAND_NAME, ForgeInitializer.getRoot(), null);
-         log.info("Caches warmed up");
-         executorService.submit(() -> {
-            java.nio.file.Path path = null;
-            try
+    void init(@Observes FurnaceStartup startup)
+    {
+        try
+        {
+            // Initialize Catapult URL
+            initializeMissionControlServiceURI();
+            log.info("Warming up internal cache");
+            // Warm up
+            getCommand(DEFAULT_COMMAND_NAME, ForgeInitializer.getRoot(), null);
+            log.info("Caches warmed up");
+            executorService.submit(() -> {
+                java.nio.file.Path path = null;
+                try
+                {
+                    while ((path = directoriesToDelete.take()) != null)
+                    {
+                        log.info("Deleting " + path);
+                        io.openshift.launchpad.backend.util.Paths.deleteDirectory(path);
+                    }
+                }
+                catch (IOException io)
+                {
+                    log.log(Level.SEVERE, "Error while deleting" + path, io);
+                }
+                catch (InterruptedException e)
+                {
+                    // Do nothing
+                }
+            });
+        }
+        catch (Exception e)
+        {
+            log.log(Level.SEVERE, "Error while warming up cache", e);
+        }
+    }
+
+    @GET
+    @javax.ws.rs.Path("/version")
+    @Produces(MediaType.APPLICATION_JSON)
+    public JsonObject getInfo()
+    {
+        return createObjectBuilder()
+                    .add("backendVersion", String.valueOf(ForgeInitializer.getVersion()))
+                    .add("forgeVersion", Versions.getImplementationVersionFor(UIContext.class).toString())
+                    .build();
+    }
+
+    @GET
+    @javax.ws.rs.Path("/commands/{commandName}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public JsonObject getCommandInfo(
+                @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
+                @Context HttpHeaders headers)
+                throws Exception
+    {
+        validateCommand(commandName);
+        JsonObjectBuilder builder = createObjectBuilder();
+        try (CommandController controller = getCommand(commandName, ForgeInitializer.getRoot(), headers))
+        {
+            helper.describeController(builder, controller);
+        }
+        return builder.build();
+    }
+
+    @POST
+    @javax.ws.rs.Path("/commands/{commandName}/validate")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public JsonObject validateCommand(JsonObject content,
+                @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
+                @Context HttpHeaders headers)
+                throws Exception
+    {
+        validateCommand(commandName);
+        JsonObjectBuilder builder = createObjectBuilder();
+        try (CommandController controller = getCommand(commandName, ForgeInitializer.getRoot(), headers))
+        {
+            helper.populateControllerAllInputs(content, controller);
+            helper.describeCurrentState(builder, controller);
+            helper.describeValidation(builder, controller);
+            helper.describeInputs(builder, controller);
+        }
+        return builder.build();
+    }
+
+    @POST
+    @javax.ws.rs.Path("/commands/{commandName}/next")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public JsonObject nextStep(JsonObject content,
+                @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
+                @Context HttpHeaders headers)
+                throws Exception
+    {
+        validateCommand(commandName);
+        int stepIndex = content.getInt("stepIndex", 1);
+        JsonObjectBuilder builder = createObjectBuilder();
+        try (CommandController controller = getCommand(commandName, ForgeInitializer.getRoot(), headers))
+        {
+            if (!(controller instanceof WizardCommandController))
             {
-               while ((path = directoriesToDelete.take()) != null)
-               {
-                  log.info("Deleting " + path);
-                  io.openshift.launchpad.backend.util.Paths.deleteDirectory(path);
-               }
+                throw new WebApplicationException("Controller is not a wizard", Status.BAD_REQUEST);
             }
-            catch (IOException io)
+            WizardCommandController wizardController = (WizardCommandController) controller;
+            for (int i = 0; i < stepIndex; i++)
             {
-               log.log(Level.SEVERE, "Error while deleting" + path, io);
+                if (wizardController.canMoveToNextStep())
+                {
+                    helper.populateController(content, wizardController);
+                    helper.describeValidation(builder, controller);
+                    wizardController.next().initialize();
+                }
             }
-            catch (InterruptedException e)
+            helper.describeMetadata(builder, controller);
+            helper.describeCurrentState(builder, controller);
+            helper.describeInputs(builder, controller);
+        }
+        return builder.build();
+    }
+
+    @POST
+    @javax.ws.rs.Path("/commands/{commandName}/zip")
+    @Consumes(MediaType.APPLICATION_FORM_URLENCODED)
+    public Response downloadZip(Form form,
+                @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
+                @Context HttpHeaders headers)
+                throws Exception
+    {
+        validateCommand(commandName);
+        String stepIndex = form.asMap().remove("stepIndex").get(0);
+        final JsonBuilder jsonBuilder = new JsonBuilder().createJson(Integer.parseInt(stepIndex));
+        for (Map.Entry<String, List<String>> entry : form.asMap().entrySet())
+        {
+            jsonBuilder.addInput(entry.getKey(), entry.getValue());
+        }
+        JsonObject content = jsonBuilder.build();
+        java.nio.file.Path path = Files.createTempDirectory("projectDir");
+        try (CommandController controller = getCommand(commandName, path, headers))
+        {
+            helper.populateControllerAllInputs(content, controller);
+            if (controller.isValid())
             {
-               // Do nothing
-            }
-         });
-      }
-      catch (Exception e)
-      {
-         log.log(Level.SEVERE, "Error while warming up cache", e);
-      }
-   }
-
-   @GET
-   @javax.ws.rs.Path("/version")
-   @Produces(MediaType.APPLICATION_JSON)
-   public JsonObject getInfo()
-   {
-      return createObjectBuilder()
-               .add("backendVersion", String.valueOf(ForgeInitializer.getVersion()))
-               .add("forgeVersion", Versions.getImplementationVersionFor(UIContext.class).toString())
-               .build();
-   }
-
-   @GET
-   @javax.ws.rs.Path("/commands/{commandName}")
-   @Produces(MediaType.APPLICATION_JSON)
-   public JsonObject getCommandInfo(
-            @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
-            @Context HttpHeaders headers)
-            throws Exception
-   {
-      validateCommand(commandName);
-      JsonObjectBuilder builder = createObjectBuilder();
-      try (CommandController controller = getCommand(commandName, ForgeInitializer.getRoot(), headers))
-      {
-         helper.describeController(builder, controller);
-      }
-      return builder.build();
-   }
-
-   @POST
-   @javax.ws.rs.Path("/commands/{commandName}/validate")
-   @Consumes(MediaType.APPLICATION_JSON)
-   @Produces(MediaType.APPLICATION_JSON)
-   public JsonObject validateCommand(JsonObject content,
-            @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
-            @Context HttpHeaders headers)
-            throws Exception
-   {
-      validateCommand(commandName);
-      JsonObjectBuilder builder = createObjectBuilder();
-      try (CommandController controller = getCommand(commandName, ForgeInitializer.getRoot(), headers))
-      {
-         helper.populateControllerAllInputs(content, controller);
-         helper.describeCurrentState(builder, controller);
-         helper.describeValidation(builder, controller);
-         helper.describeInputs(builder, controller);
-      }
-      return builder.build();
-   }
-
-   @POST
-   @javax.ws.rs.Path("/commands/{commandName}/next")
-   @Consumes(MediaType.APPLICATION_JSON)
-   @Produces(MediaType.APPLICATION_JSON)
-   public JsonObject nextStep(JsonObject content,
-            @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
-            @Context HttpHeaders headers)
-            throws Exception
-   {
-      validateCommand(commandName);
-      int stepIndex = content.getInt("stepIndex", 1);
-      JsonObjectBuilder builder = createObjectBuilder();
-      try (CommandController controller = getCommand(commandName, ForgeInitializer.getRoot(), headers))
-      {
-         if (!(controller instanceof WizardCommandController))
-         {
-            throw new WebApplicationException("Controller is not a wizard", Status.BAD_REQUEST);
-         }
-         WizardCommandController wizardController = (WizardCommandController) controller;
-         for (int i = 0; i < stepIndex; i++)
-         {
-            if (wizardController.canMoveToNextStep())
-            {
-               helper.populateController(content, wizardController);
-               helper.describeValidation(builder, controller);
-               wizardController.next().initialize();
-            }
-         }
-         helper.describeMetadata(builder, controller);
-         helper.describeCurrentState(builder, controller);
-         helper.describeInputs(builder, controller);
-      }
-      return builder.build();
-   }
-
-   @POST
-   @javax.ws.rs.Path("/commands/{commandName}/zip")
-   @Consumes(MediaType.APPLICATION_FORM_URLENCODED)
-   public Response downloadZip(Form form,
-            @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
-            @Context HttpHeaders headers)
-            throws Exception
-   {
-      validateCommand(commandName);
-      String stepIndex = form.asMap().remove("stepIndex").get(0);
-      final JsonBuilder jsonBuilder = new JsonBuilder().createJson(Integer.parseInt(stepIndex));
-      for (Map.Entry<String, List<String>> entry : form.asMap().entrySet())
-      {
-         jsonBuilder.addInput(entry.getKey(), entry.getValue());
-      }
-      JsonObject content = jsonBuilder.build();
-      java.nio.file.Path path = Files.createTempDirectory("projectDir");
-      try (CommandController controller = getCommand(commandName, path, headers))
-      {
-         helper.populateControllerAllInputs(content, controller);
-         if (controller.isValid())
-         {
-            Result result = controller.execute();
-            if (result instanceof Failed)
-            {
-               return Response.serverError().entity(result.getMessage()).build();
+                Result result = controller.execute();
+                if (result instanceof Failed)
+                {
+                    return Response.serverError().entity(result.getMessage()).build();
+                }
+                else
+                {
+                    UISelection<?> selection = controller.getContext().getSelection();
+                    java.nio.file.Path projectPath = Paths.get(selection.get().toString());
+                    // If downloading a zip, delete .openshiftio dir
+                    Path openshiftIoPath = projectPath.resolve(".openshiftio");
+                    if (Files.exists(openshiftIoPath))
+                    {
+                        io.openshift.launchpad.backend.util.Paths.deleteDirectory(openshiftIoPath);
+                    }
+                    String artifactId = findArtifactId(content);
+                    byte[] zipContents = io.openshift.launchpad.backend.util.Paths.zip(artifactId, projectPath);
+                    return Response
+                                .ok(zipContents)
+                                .type("application/zip")
+                                .header("Content-Disposition", "attachment; filename=\"" + artifactId + ".zip\"")
+                                .build();
+                }
             }
             else
             {
-               UISelection<?> selection = controller.getContext().getSelection();
-               java.nio.file.Path projectPath = Paths.get(selection.get().toString());
-               // If downloading a zip, delete .openshiftio dir
-               Path openshiftIoPath = projectPath.resolve(".openshiftio");
-               if (Files.exists(openshiftIoPath))
-               {
-                  io.openshift.launchpad.backend.util.Paths.deleteDirectory(openshiftIoPath);
-               }
-               String artifactId = findArtifactId(content);
-               byte[] zipContents = io.openshift.launchpad.backend.util.Paths.zip(artifactId, projectPath);
-               return Response
-                        .ok(zipContents)
-                        .type("application/zip")
-                        .header("Content-Disposition", "attachment; filename=\"" + artifactId + ".zip\"")
-                        .build();
+                JsonObjectBuilder builder = createObjectBuilder();
+                helper.describeValidation(builder, controller);
+                return Response.status(Status.PRECONDITION_FAILED).entity(builder.build()).build();
             }
-         }
-         else
-         {
-            JsonObjectBuilder builder = createObjectBuilder();
-            helper.describeValidation(builder, controller);
-            return Response.status(Status.PRECONDITION_FAILED).entity(builder.build()).build();
-         }
-      }
-      finally
-      {
-         directoriesToDelete.offer(path);
-      }
-   }
+        }
+        finally
+        {
+            directoriesToDelete.offer(path);
+        }
+    }
 
-   @POST
-   @javax.ws.rs.Path("/commands/{commandName}/missioncontrol")
-   @Consumes(MediaType.APPLICATION_JSON)
-   public Response uploadZip(JsonObject content,
-            @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
-            @Context HttpHeaders headers)
-            throws Exception
-   {
-      validateCommand(commandName);
-      java.nio.file.Path path = Files.createTempDirectory("projectDir");
-      try (CommandController controller = getCommand(commandName, path, headers))
-      {
-         helper.populateControllerAllInputs(content, controller);
-         if (controller.isValid())
-         {
-            Result result = controller.execute();
-            if (result instanceof Failed)
+    @POST
+    @javax.ws.rs.Path("/commands/{commandName}/missioncontrol")
+    @Consumes(MediaType.APPLICATION_JSON)
+    public Response uploadZip(JsonObject content,
+                @PathParam("commandName") @DefaultValue(DEFAULT_COMMAND_NAME) String commandName,
+                @Context HttpHeaders headers)
+                throws Exception
+    {
+        validateCommand(commandName);
+        java.nio.file.Path path = Files.createTempDirectory("projectDir");
+        try (CommandController controller = getCommand(commandName, path, headers))
+        {
+            helper.populateControllerAllInputs(content, controller);
+            if (controller.isValid())
             {
-               return Response.serverError().entity(result.getMessage()).build();
+                Result result = controller.execute();
+                if (result instanceof Failed)
+                {
+                    return Response.serverError().entity(result.getMessage()).build();
+                }
+                else
+                {
+                    UISelection<?> selection = controller.getContext().getSelection();
+                    java.nio.file.Path projectPath = Paths.get(selection.get().toString());
+                    String artifactId = findArtifactId(content);
+                    byte[] zipContents = io.openshift.launchpad.backend.util.Paths.zip(artifactId, projectPath);
+                    String gitHubRepositoryDescription = "Generated by Launchpad " + ForgeInitializer.getVersion();
+                    Client client = ClientBuilder.newBuilder().build();
+                    try
+                    {
+                        WebTarget target = client.target(missionControlURI)
+                                    .property(HttpHeaders.CONTENT_TYPE, MediaType.MULTIPART_FORM_DATA);
+
+                        // Create request body
+                        MultipartFormDataOutput multipartFormDataOutput = new MultipartFormDataOutput();
+                        multipartFormDataOutput.addFormData("file", new ByteArrayInputStream(zipContents),
+                                    MediaType.MULTIPART_FORM_DATA_TYPE, "project.zip");
+                        multipartFormDataOutput.addFormData("gitHubRepositoryDescription", gitHubRepositoryDescription,
+                                    MediaType.APPLICATION_FORM_URLENCODED_TYPE);
+
+                        // Execute POST Request
+                        Response post = target.request()
+                                    .header(HttpHeaders.CONTENT_TYPE, MediaType.MULTIPART_FORM_DATA)
+                                    // Propagate Authorization header
+                                    .header(HttpHeaders.AUTHORIZATION,
+                                                headers.getHeaderString(HttpHeaders.AUTHORIZATION))
+                                    .post(Entity.entity(multipartFormDataOutput, MediaType.MULTIPART_FORM_DATA_TYPE));
+
+                        URI location = post.getLocation();
+                        if (location != null)
+                        {
+                            return Response.ok(location.toString()).build();
+                        }
+                        else
+                        {
+                            return Response.ok(post.readEntity(String.class), MediaType.APPLICATION_JSON).build();
+                        }
+                    }
+                    finally
+                    {
+                        client.close();
+                    }
+                }
             }
             else
             {
-               UISelection<?> selection = controller.getContext().getSelection();
-               java.nio.file.Path projectPath = Paths.get(selection.get().toString());
-               String artifactId = findArtifactId(content);
-               byte[] zipContents = io.openshift.launchpad.backend.util.Paths.zip(artifactId, projectPath);
-               String gitHubRepositoryDescription = "Generated by Launchpad " + ForgeInitializer.getVersion();
-               Client client = ClientBuilder.newBuilder().build();
-               try
-               {
-                  WebTarget target = client.target(missionControlURI)
-                           .property(HttpHeaders.CONTENT_TYPE, MediaType.MULTIPART_FORM_DATA);
-
-                  // Create request body
-                  MultipartFormDataOutput multipartFormDataOutput = new MultipartFormDataOutput();
-                  multipartFormDataOutput.addFormData("file", new ByteArrayInputStream(zipContents),
-                           MediaType.MULTIPART_FORM_DATA_TYPE, "project.zip");
-                  multipartFormDataOutput.addFormData("gitHubRepositoryDescription", gitHubRepositoryDescription,
-                           MediaType.APPLICATION_FORM_URLENCODED_TYPE);
-
-                  // Execute POST Request
-                  Response post = target.request()
-                           .header(HttpHeaders.CONTENT_TYPE, MediaType.MULTIPART_FORM_DATA)
-                           // Propagate Authorization header
-                           .header(HttpHeaders.AUTHORIZATION, headers.getHeaderString(HttpHeaders.AUTHORIZATION))
-                           .post(Entity.entity(multipartFormDataOutput, MediaType.MULTIPART_FORM_DATA_TYPE));
-
-                  URI location = post.getLocation();
-                  if (location != null)
-                  {
-                     return Response.ok(location.toString()).build();
-                  }
-                  else
-                  {
-                     return Response.ok(post.readEntity(String.class), MediaType.APPLICATION_JSON).build();
-                  }
-               }
-               finally
-               {
-                  client.close();
-               }
+                JsonObjectBuilder builder = createObjectBuilder();
+                helper.describeValidation(builder, controller);
+                return Response.status(Status.PRECONDITION_FAILED).entity(builder.build()).build();
             }
-         }
-         else
-         {
-            JsonObjectBuilder builder = createObjectBuilder();
-            helper.describeValidation(builder, controller);
-            return Response.status(Status.PRECONDITION_FAILED).entity(builder.build()).build();
-         }
-      }
-      finally
-      {
-         directoriesToDelete.offer(path);
-      }
-   }
+        }
+        finally
+        {
+            directoriesToDelete.offer(path);
+        }
+    }
 
-   protected void validateCommand(String commandName)
-   {
-      if (commandMap.get(commandName) == null)
-      {
-         String message = "No such command '" + commandName + "'. Supported commmands are '"
-                  + String.join("', '", commandMap.keySet()) + "'";
-         throw new WebApplicationException(message, Status.NOT_FOUND);
-      }
-   }
+    protected void validateCommand(String commandName)
+    {
+        if (commandMap.get(commandName) == null)
+        {
+            String message = "No such command '" + commandName + "'. Supported commmands are '"
+                        + String.join("', '", commandMap.keySet()) + "'";
+            throw new WebApplicationException(message, Status.NOT_FOUND);
+        }
+    }
 
-   private String findArtifactId(JsonObject content)
-   {
-      String artifactId = content.getJsonArray("inputs").stream()
-               .filter(input -> "named".equals(((JsonObject) input).getString("name")))
-               .map(input -> ((JsonString) ((JsonObject) input).get("value")).getString())
-               .findFirst().orElse("demo");
-      return artifactId;
-   }
+    private String findArtifactId(JsonObject content)
+    {
+        String artifactId = content.getJsonArray("inputs").stream()
+                    .filter(input -> "named".equals(((JsonObject) input).getString("name")))
+                    .map(input -> ((JsonString) ((JsonObject) input).get("value")).getString())
+                    .findFirst().orElse("demo");
+        return artifactId;
+    }
 
-   private void initializeMissionControlServiceURI()
-   {
-      String host = System.getProperty(LAUNCHPAD_MISSIONCONTROL_SERVICE_HOST,
-               System.getenv(LAUNCHPAD_MISSIONCONTROL_SERVICE_HOST));
-      if (host == null)
-      {
-         host = "mission-control";
-      }
-      UriBuilder uri = UriBuilder.fromPath("/api/missioncontrol/upload").host(host).scheme("http");
-      String port = System.getProperty(LAUNCHPAD_MISSIONCONTROL_SERVICE_PORT,
-               System.getenv(LAUNCHPAD_MISSIONCONTROL_SERVICE_PORT));
-      uri.port(port != null ? Integer.parseInt(port) : 80);
-      missionControlURI = uri.build();
-   }
+    private void initializeMissionControlServiceURI()
+    {
+        String host = System.getProperty(LAUNCHPAD_MISSIONCONTROL_SERVICE_HOST,
+                    System.getenv(LAUNCHPAD_MISSIONCONTROL_SERVICE_HOST));
+        if (host == null)
+        {
+            host = "mission-control";
+        }
+        UriBuilder uri = UriBuilder.fromPath("/api/missioncontrol/upload").host(host).scheme("http");
+        String port = System.getProperty(LAUNCHPAD_MISSIONCONTROL_SERVICE_PORT,
+                    System.getenv(LAUNCHPAD_MISSIONCONTROL_SERVICE_PORT));
+        uri.port(port != null ? Integer.parseInt(port) : 80);
+        missionControlURI = uri.build();
+    }
 
-   private CommandController getCommand(String name, Path initialPath, HttpHeaders headers) throws Exception
-   {
-      RestUIContext context = createUIContext(initialPath, headers);
-      UICommand command = commandFactory.getNewCommandByName(context, commandMap.get(name));
-      CommandController controller = controllerFactory.createController(context,
-               new RestUIRuntime(Collections.emptyList()), command);
-      controller.initialize();
-      return controller;
-   }
+    private CommandController getCommand(String name, Path initialPath, HttpHeaders headers) throws Exception
+    {
+        RestUIContext context = createUIContext(initialPath, headers);
+        UICommand command = commandFactory.getNewCommandByName(context, commandMap.get(name));
+        CommandController controller = controllerFactory.createController(context,
+                    new RestUIRuntime(Collections.emptyList()), command);
+        controller.initialize();
+        return controller;
+    }
 
-   private RestUIContext createUIContext(Path initialPath, HttpHeaders headers)
-   {
-      Resource<?> selection = resourceFactory.create(initialPath.toFile());
-      RestUIContext context = new RestUIContext(selection, Collections.emptyList());
-      if (headers != null)
-      {
-         Map<Object, Object> attributeMap = context.getAttributeMap();
-         MultivaluedMap<String, String> requestHeaders = headers.getRequestHeaders();
-         requestHeaders.keySet().forEach(key -> attributeMap.put(key, headers.getRequestHeader(key)));
-      }
-      return context;
-   }
+    private RestUIContext createUIContext(Path initialPath, HttpHeaders headers)
+    {
+        Resource<?> selection = resourceFactory.create(initialPath.toFile());
+        RestUIContext context = new RestUIContext(selection, Collections.emptyList());
+        if (headers != null)
+        {
+            Map<Object, Object> attributeMap = context.getAttributeMap();
+            MultivaluedMap<String, String> requestHeaders = headers.getRequestHeaders();
+            requestHeaders.keySet().forEach(key -> attributeMap.put(key, headers.getRequestHeader(key)));
+        }
+        return context;
+    }
 }
